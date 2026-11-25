@@ -1,0 +1,158 @@
+name: Render 3D Short from Uploaded ZIP
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_filename:
+        description: 'ZIP file uploaded to repo root'
+        required: true
+        default: 'melatonin-gummy-remotion.zip'
+      composition_id:
+        description: 'Remotion Composition ID'
+        required: true
+        default: 'MelatoninGummyShort'
+      output_filename:
+        description: 'Output filename (.mp4 or .png)'
+        required: true
+        default: 'melatonin-gummy-3d.mp4'
+      scale:
+        description: 'Scale (1 = 1080x1920, 1.3333 = 2K 1440x2560)'
+        required: false
+        default: '1'
+      is_still:
+        description: 'Render single still frame instead of full video? (true/false)'
+        required: false
+        default: 'false'
+      frame_number:
+        description: 'Frame number if is_still is true (0-5215)'
+        required: false
+        default: '45'
+
+jobs:
+  render:
+    name: Extract ZIP & Render 3D Video
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install System Dependencies (Chromium, FFmpeg, Unzip)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            unzip \
+            ffmpeg \
+            fonts-noto-core \
+            libatk1.0-0 \
+            libcairo2 \
+            libcups2 \
+            libdbus-1-3 \
+            libexpat1 \
+            libfontconfig1 \
+            libgbm1 \
+            libgdk-pixbuf-2.0-0 \
+            libglib2.0-0 \
+            libgtk-3-0 \
+            libnspr4 \
+            libnss3 \
+            libpango-1.0-0 \
+            libpangocairo-1.0-0 \
+            libx11-6 \
+            libx11-xcb1 \
+            libxcb1 \
+            libxcomposite1 \
+            libxcursor1 \
+            libxdamage1 \
+            libxext6 \
+            libxfixes3 \
+            libxi6 \
+            libxrandr2 \
+            libxrender1 \
+            libxss1 \
+            libxtst6 \
+            libasound2t64
+
+      - name: Extract Uploaded ZIP & Locate Project Root
+        id: unpack
+        run: |
+          ZIP_FILE="${{ github.event.inputs.zip_filename }}"
+          if [ ! -f "$ZIP_FILE" ]; then
+            echo "ERROR: $ZIP_FILE not found in repository root."
+            ls -la
+            exit 1
+          fi
+          mkdir -p _extracted
+          unzip -o "$ZIP_FILE" -d _extracted
+          PKG_PATH=$(find _extracted -maxdepth 3 -name "package.json" | head -n 1)
+          if [ -z "$PKG_PATH" ]; then
+            echo "ERROR: package.json not found inside $ZIP_FILE"
+            exit 1
+          fi
+          PROJECT_DIR=$(dirname "$PKG_PATH")
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "Detected project root: $PROJECT_DIR"
+
+      - name: Install Project Dependencies & Headless Browser
+        working-directory: ${{ steps.unpack.outputs.project_dir }}
+        run: |
+          npm install
+          npx remotion browser ensure
+
+      - name: Build Audio Mix (Voiceover + Synced Foley SFX)
+        working-directory: ${{ steps.unpack.outputs.project_dir }}
+        run: |
+          mkdir -p out
+          if [ -f "audio/generate_sfx.py" ] && [ -f "public/voiceover.mp3" ]; then
+            python3 audio/generate_sfx.py --out out/sfx.wav
+            ffmpeg -y -i public/voiceover.mp3 -i out/sfx.wav \
+              -filter_complex "[0:a]aresample=48000,volume=1.0[v];[1:a]volume=0.38[s];[v][s]amix=inputs=2:duration=first:dropout_transition=0[aout]" \
+              -map "[aout]" -c:a pcm_s16le out/mix.wav
+          elif [ -f "audio/generate_audio.py" ]; then
+            python3 audio/generate_audio.py --out out/mix.wav
+          elif [ -f "public/voiceover.mp3" ]; then
+            ffmpeg -y -i public/voiceover.mp3 -ar 48000 -ac 1 out/mix.wav
+          fi
+
+      - name: Render Video or Still Frame
+        working-directory: ${{ steps.unpack.outputs.project_dir }}
+        run: |
+          OUT_FILE="out/${{ github.event.inputs.output_filename }}"
+          if [ "${{ github.event.inputs.is_still }}" = "true" ]; then
+            npx remotion still src/index.ts "${{ github.event.inputs.composition_id }}" "$OUT_FILE" \
+              --frame="${{ github.event.inputs.frame_number }}" \
+              --scale="${{ github.event.inputs.scale }}" \
+              --gl=angle
+          else
+            npx remotion render src/index.ts "${{ github.event.inputs.composition_id }}" out/video-silent.mp4 \
+              --codec=h264 \
+              --crf=16 \
+              --scale="${{ github.event.inputs.scale }}" \
+              --pixel-format=yuv420p \
+              --gl=angle \
+              --concurrency=100%
+            if [ -f "out/mix.wav" ]; then
+              ffmpeg -y -i out/video-silent.mp4 -i out/mix.wav \
+                -map 0:v:0 -map 1:a:0 \
+                -c:v copy -c:a aac -b:a 192k -shortest \
+                "$OUT_FILE"
+            else
+              mv out/video-silent.mp4 "$OUT_FILE"
+            fi
+          fi
+
+      - name: Upload Rendered Video Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rendered-3d-short
+          path: ${{ steps.unpack.outputs.project_dir }}/out/${{ github.event.inputs.output_filename }}
+          retention-days: 14
