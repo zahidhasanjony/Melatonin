@@ -16,7 +16,7 @@ on:
         required: true
         default: 'melatonin-gummy-3d.mp4'
       scale:
-        description: 'Scale (1 = 1080x1920, 1.3333 = 2K 1440x2560)'
+        description: 'Scale (1 = 1080x1920, 0.6667 = 720x1280 faster)'
         required: false
         default: '1'
       is_still:
@@ -46,13 +46,16 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install System Dependencies (Chromium, FFmpeg, Unzip)
+      - name: Install System Dependencies (Chromium, FFmpeg, Unzip, Software GL)
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             unzip \
             ffmpeg \
             fonts-noto-core \
+            libgl1-mesa-dri \
+            libegl1 \
+            libgles2 \
             libatk1.0-0 \
             libcairo2 \
             libcups2 \
@@ -82,7 +85,7 @@ jobs:
             libxtst6 \
             libasound2t64
 
-      - name: Extract Uploaded ZIP & Locate Project Root
+      - name: Extract Uploaded ZIP & Patch OpenGL Renderer to SwANGLE
         id: unpack
         run: |
           ZIP_FILE="${{ github.event.inputs.zip_filename }}"
@@ -99,6 +102,10 @@ jobs:
             exit 1
           fi
           PROJECT_DIR=$(dirname "$PKG_PATH")
+          # GitHub Actions runners have no physical GPU; switch angle -> swangle automatically
+          if [ -f "$PROJECT_DIR/remotion.config.ts" ]; then
+            sed -i "s/'angle'/'swangle'/g" "$PROJECT_DIR/remotion.config.ts"
+          fi
           echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
           echo "Detected project root: $PROJECT_DIR"
 
@@ -123,7 +130,7 @@ jobs:
             ffmpeg -y -i public/voiceover.mp3 -ar 48000 -ac 1 out/mix.wav
           fi
 
-      - name: Render Video or Still Frame
+      - name: Render Video or Still Frame (Software WebGL via SwANGLE)
         working-directory: ${{ steps.unpack.outputs.project_dir }}
         run: |
           OUT_FILE="out/${{ github.event.inputs.output_filename }}"
@@ -131,15 +138,15 @@ jobs:
             npx remotion still src/index.ts "${{ github.event.inputs.composition_id }}" "$OUT_FILE" \
               --frame="${{ github.event.inputs.frame_number }}" \
               --scale="${{ github.event.inputs.scale }}" \
-              --gl=angle
+              --gl=swangle
           else
             npx remotion render src/index.ts "${{ github.event.inputs.composition_id }}" out/video-silent.mp4 \
               --codec=h264 \
               --crf=16 \
               --scale="${{ github.event.inputs.scale }}" \
               --pixel-format=yuv420p \
-              --gl=angle \
-              --concurrency=100%
+              --gl=swangle \
+              --concurrency=2
             if [ -f "out/mix.wav" ]; then
               ffmpeg -y -i out/video-silent.mp4 -i out/mix.wav \
                 -map 0:v:0 -map 1:a:0 \
