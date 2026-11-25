@@ -1,36 +1,41 @@
-name: Render 3D Short from Uploaded ZIP
+name: Render 3D Short v2 (QA Sheet + Whisper + SwANGLE)
 
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: 'Run mode: qa_sheet (fast ~90s 12-frame grid), still (1 frame), or full_video'
+        required: true
+        type: choice
+        default: 'qa_sheet'
+        options:
+          - qa_sheet
+          - still
+          - full_video
       zip_filename:
         description: 'ZIP file uploaded to repo root'
         required: true
-        default: 'melatonin-gummy-remotion.zip'
+        default: 'melatonin-gummy-remotion-v2.zip'
       composition_id:
         description: 'Remotion Composition ID'
         required: true
         default: 'MelatoninGummyShort'
       output_filename:
-        description: 'Output filename (.mp4 or .png)'
+        description: 'Output MP4/PNG filename (used for full_video or still mode)'
         required: true
-        default: 'melatonin-gummy-3d.mp4'
+        default: 'melatonin-gummy-3d-v2.mp4'
       scale:
-        description: 'Scale (1 = 1080x1920, 0.6667 = 720x1280 faster)'
+        description: 'Render scale (1 = 1080x1920, 0.6667 = 720x1280 faster)'
         required: false
-        default: '1'
-      is_still:
-        description: 'Render single still frame instead of full video? (true/false)'
-        required: false
-        default: 'false'
+        default: '0.6667'
       frame_number:
-        description: 'Frame number if is_still is true (0-5215)'
+        description: 'Frame number (only used when mode=still)'
         required: false
         default: '45'
 
 jobs:
   render:
-    name: Extract ZIP & Render 3D Video
+    name: Extract ZIP, Align Voiceover & Render
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout Repository
@@ -84,82 +89,102 @@ jobs:
             libxss1 \
             libxtst6 \
             libasound2t64
+          pip install --quiet pillow faster-whisper
 
-      - name: Extract Uploaded ZIP & Patch OpenGL Renderer to SwANGLE
+      - name: Extract Uploaded ZIP & Configure SwANGLE
         id: unpack
         run: |
           ZIP_FILE="${{ github.event.inputs.zip_filename }}"
           if [ ! -f "$ZIP_FILE" ]; then
-            echo "ERROR: $ZIP_FILE not found in repository root."
+            echo "ERROR: $ZIP_FILE not found in repo root."
             ls -la
             exit 1
           fi
           mkdir -p _extracted
           unzip -o "$ZIP_FILE" -d _extracted
           PKG_PATH=$(find _extracted -maxdepth 3 -name "package.json" | head -n 1)
-          if [ -z "$PKG_PATH" ]; then
-            echo "ERROR: package.json not found inside $ZIP_FILE"
-            exit 1
-          fi
           PROJECT_DIR=$(dirname "$PKG_PATH")
-          # GitHub Actions runners have no physical GPU; switch angle -> swangle automatically
           if [ -f "$PROJECT_DIR/remotion.config.ts" ]; then
             sed -i "s/'angle'/'swangle'/g" "$PROJECT_DIR/remotion.config.ts"
           fi
           echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
-          echo "Detected project root: $PROJECT_DIR"
 
-      - name: Install Project Dependencies & Headless Browser
+      - name: Install Node Dependencies & Headless Browser
         working-directory: ${{ steps.unpack.outputs.project_dir }}
         run: |
           npm install
           npx remotion browser ensure
 
-      - name: Build Audio Mix (Voiceover + Synced Foley SFX)
+      - name: Zero-Drift Whisper Word Alignment
+        working-directory: ${{ steps.unpack.outputs.project_dir }}
+        run: |
+          if [ -f "audio/align_whisper.py" ] && [ -f "public/voiceover.mp3" ]; then
+            python3 audio/align_whisper.py
+          fi
+
+      - name: Render 12-Frame QA Contact Sheet (Fast Mode)
+        if: github.event.inputs.mode == 'qa_sheet'
+        working-directory: ${{ steps.unpack.outputs.project_dir }}
+        run: |
+          mkdir -p out/qa_stills
+          # 12 key frames covering all 5 enclosed 3D sets & major beats
+          FRAMES=(45 140 240 540 1080 1240 1820 2120 2700 3290 3560 4420)
+          IDX=1
+          for F in "${FRAMES[@]}"; do
+            TAG=$(printf "%02d_f%04d" "$IDX" "$F")
+            npx remotion still src/index.ts "${{ github.event.inputs.composition_id }}" "out/qa_stills/${TAG}.png" \
+              --frame="$F" \
+              --scale=0.5 \
+              --gl=swangle
+            IDX=$((IDX + 1))
+          done
+          python3 scripts/make_qa_sheet.py
+
+      - name: Render Single Still Frame
+        if: github.event.inputs.mode == 'still'
         working-directory: ${{ steps.unpack.outputs.project_dir }}
         run: |
           mkdir -p out
-          if [ -f "audio/generate_sfx.py" ] && [ -f "public/voiceover.mp3" ]; then
-            python3 audio/generate_sfx.py --out out/sfx.wav
-            ffmpeg -y -i public/voiceover.mp3 -i out/sfx.wav \
-              -filter_complex "[0:a]aresample=48000,volume=1.0[v];[1:a]volume=0.38[s];[v][s]amix=inputs=2:duration=first:dropout_transition=0[aout]" \
-              -map "[aout]" -c:a pcm_s16le out/mix.wav
-          elif [ -f "audio/generate_audio.py" ]; then
-            python3 audio/generate_audio.py --out out/mix.wav
-          elif [ -f "public/voiceover.mp3" ]; then
-            ffmpeg -y -i public/voiceover.mp3 -ar 48000 -ac 1 out/mix.wav
-          fi
+          npx remotion still src/index.ts "${{ github.event.inputs.composition_id }}" "out/${{ github.event.inputs.output_filename }}" \
+            --frame="${{ github.event.inputs.frame_number }}" \
+            --scale="${{ github.event.inputs.scale }}" \
+            --gl=swangle
 
-      - name: Render Video or Still Frame (Software WebGL via SwANGLE)
+      - name: Build Ducked Audio Mix & Render Full 3D MP4
+        if: github.event.inputs.mode == 'full_video'
         working-directory: ${{ steps.unpack.outputs.project_dir }}
         run: |
-          OUT_FILE="out/${{ github.event.inputs.output_filename }}"
-          if [ "${{ github.event.inputs.is_still }}" = "true" ]; then
-            npx remotion still src/index.ts "${{ github.event.inputs.composition_id }}" "$OUT_FILE" \
-              --frame="${{ github.event.inputs.frame_number }}" \
-              --scale="${{ github.event.inputs.scale }}" \
-              --gl=swangle
-          else
-            npx remotion render src/index.ts "${{ github.event.inputs.composition_id }}" out/video-silent.mp4 \
-              --codec=h264 \
-              --crf=16 \
-              --scale="${{ github.event.inputs.scale }}" \
-              --pixel-format=yuv420p \
-              --gl=swangle \
-              --concurrency=2
-            if [ -f "out/mix.wav" ]; then
-              ffmpeg -y -i out/video-silent.mp4 -i out/mix.wav \
-                -map 0:v:0 -map 1:a:0 \
-                -c:v copy -c:a aac -b:a 192k -shortest \
-                "$OUT_FILE"
-            else
-              mv out/video-silent.mp4 "$OUT_FILE"
-            fi
-          fi
+          mkdir -p out
+          python3 audio/generate_score_sfx.py --out out/score_sfx.wav
+          ffmpeg -y -i public/voiceover.mp3 -i out/score_sfx.wav \
+            -filter_complex "[0:a]aresample=48000,volume=1.0[v];[1:a]volume=0.35[s];[v][s]amix=inputs=2:duration=first:dropout_transition=0[aout]" \
+            -map "[aout]" -c:a pcm_s16le out/mix.wav
 
-      - name: Upload Rendered Video Artifact
+          npx remotion render src/index.ts "${{ github.event.inputs.composition_id }}" out/video-silent.mp4 \
+            --codec=h264 \
+            --crf=16 \
+            --scale="${{ github.event.inputs.scale }}" \
+            --pixel-format=yuv420p \
+            --gl=swangle \
+            --concurrency=2
+
+          ffmpeg -y -i out/video-silent.mp4 -i out/mix.wav \
+            -map 0:v:0 -map 1:a:0 \
+            -c:v copy -c:a aac -b:a 192k -shortest \
+            "out/${{ github.event.inputs.output_filename }}"
+
+      - name: Upload QA Sheet Artifact
+        if: github.event.inputs.mode == 'qa_sheet'
         uses: actions/upload-artifact@v4
         with:
-          name: rendered-3d-short
+          name: qa-contact-sheet-v2
+          path: ${{ steps.unpack.outputs.project_dir }}/out/qa-contact-sheet.png
+          retention-days: 14
+
+      - name: Upload Rendered Video or Still Artifact
+        if: github.event.inputs.mode != 'qa_sheet'
+        uses: actions/upload-artifact@v4
+        with:
+          name: melatonin-v2-render
           path: ${{ steps.unpack.outputs.project_dir }}/out/${{ github.event.inputs.output_filename }}
           retention-days: 14
